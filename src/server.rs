@@ -1,7 +1,7 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
 use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
-use crate::forward::forward_bidirectional_with_idle_timeout;
+use crate::forward::{forward_bidirectional, ForwardOpts};
 use crate::helper::{generate_proxy_protocol_header, retry_notify_with_deadline, write_and_flush};
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -375,7 +375,7 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
             conn,
             service_config,
             server_config.heartbeat_interval,
-            server_config.post_half_close_idle_timeout.as_duration(),
+            server_config.forward_opts(),
             Arc::downgrade(&control_channels),
             session_key,
         );
@@ -432,7 +432,7 @@ where
         conn: T::Stream,
         service: ServerServiceConfig,
         heartbeat_interval: u64,
-        post_half_close_idle_timeout: Option<Duration>,
+        forward_opts: ForwardOpts,
         control_channels: Weak<RwLock<ControlChannelMap<T>>>,
         session_key: Nonce,
     ) -> ControlChannelHandle<T> {
@@ -475,7 +475,7 @@ where
                     if let Err(e) = run_tcp_connection_pool::<T>(
                         bind_addr,
                         proxy_protocol.clone(),
-                        post_half_close_idle_timeout,
+                        forward_opts,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -509,7 +509,7 @@ where
                 async move {
                     if let Err(e) = run_socket_stream_connection_pool::<T>(
                         bind_addr,
-                        post_half_close_idle_timeout,
+                        forward_opts,
                         data_ch_rx,
                         data_ch_req_tx,
                         shutdown_rx_clone,
@@ -806,7 +806,7 @@ fn socket_stream_listen_and_send(
 async fn run_tcp_connection_pool<T: Transport>(
     bind_addr: String,
     proxy_protocol: String,
-    post_half_close_idle_timeout: Option<Duration>,
+    forward_opts: ForwardOpts,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -833,13 +833,7 @@ async fn run_tcp_connection_pool<T: Transport>(
                                 }
                             }
                         }
-                        if let Err(e) = forward_bidirectional_with_idle_timeout(
-                            ch,
-                            v,
-                            post_half_close_idle_timeout,
-                        )
-                        .await
-                        {
+                        if let Err(e) = forward_bidirectional(ch, v, forward_opts).await {
                             log_forwarder_outcome("tcp", &e);
                         }
                     });
@@ -870,7 +864,7 @@ async fn run_tcp_connection_pool<T: Transport>(
 #[instrument(skip_all)]
 async fn run_socket_stream_connection_pool<T: Transport>(
     bind_addr: String,
-    post_half_close_idle_timeout: Option<Duration>,
+    forward_opts: ForwardOpts,
     mut data_ch_rx: mpsc::Receiver<T::Stream>,
     _data_ch_req_tx: mpsc::UnboundedSender<bool>,
     shutdown_rx: broadcast::Receiver<bool>,
@@ -886,13 +880,7 @@ async fn run_socket_stream_connection_pool<T: Transport>(
                 if write_and_flush(&mut ch, &cmd).await.is_ok() {
                     let v = visitor.take().unwrap();
                     tokio::spawn(async move {
-                        if let Err(e) = forward_bidirectional_with_idle_timeout(
-                            ch,
-                            v,
-                            post_half_close_idle_timeout,
-                        )
-                        .await
-                        {
+                        if let Err(e) = forward_bidirectional(ch, v, forward_opts).await {
                             log_forwarder_outcome("socket_stream", &e);
                         }
                     });
@@ -1077,7 +1065,7 @@ mod tests {
                 server_conn,
                 tcp_service(service_addr),
                 0,
-                None,
+                ForwardOpts::default(),
                 Arc::downgrade(&control_channels),
                 session_key,
             );
@@ -1113,7 +1101,7 @@ mod tests {
                 server_conn,
                 tcp_service(service_addr),
                 0,
-                None,
+                ForwardOpts::default(),
                 Arc::downgrade(&control_channels),
                 session_key,
             );

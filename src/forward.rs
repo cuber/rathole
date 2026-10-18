@@ -12,27 +12,45 @@ use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-/// Buffer size per direction. Equal to tokio's `DEFAULT_BUF_SIZE` (8 KiB,
-/// `tokio/src/io/util/mod.rs`), which is what `io::copy` and
-/// `copy_bidirectional` allocate per direction, so the per-connection
+/// Default buffer size per direction. Equal to tokio's `DEFAULT_BUF_SIZE`
+/// (8 KiB, `tokio/src/io/util/mod.rs`), which is what `io::copy` and
+/// `copy_bidirectional` allocate per direction, so the default per-connection
 /// footprint is unchanged from the `copy_bidirectional` call this replaces.
-const FORWARD_BUF_SIZE: usize = 8 * 1024;
+pub(crate) const DEFAULT_FORWARD_BUFFER_SIZE: usize = 8 * 1024;
+
+/// Per-forwarder tuning resolved from the `[client]` / `[server]` block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ForwardOpts {
+    /// `None` disables the post-half-close idle timeout (legacy
+    /// `copy_bidirectional` behavior).
+    pub post_half_close_idle_timeout: Option<Duration>,
+    /// Buffer size per direction in bytes; each forwarded connection holds
+    /// two of these. Must be non-zero (a zero-length read looks like EOF).
+    pub buffer_size: usize,
+}
+
+impl Default for ForwardOpts {
+    fn default() -> Self {
+        ForwardOpts {
+            post_half_close_idle_timeout: None,
+            buffer_size: DEFAULT_FORWARD_BUFFER_SIZE,
+        }
+    }
+}
 
 /// Forward bytes in both directions between `a` and `b` until either side
 /// closes (or errors). After the first side closes, the surviving direction
-/// is bounded by `idle`: every successful read resets the deadline; if the
-/// deadline fires the forwarder returns `Err(TimedOut)`. `None` disables the
-/// post-half-close timeout entirely (matching legacy `copy_bidirectional`
-/// behavior).
-pub(crate) async fn forward_bidirectional_with_idle_timeout<A, B>(
-    a: A,
-    b: B,
-    idle: Option<Duration>,
-) -> io::Result<()>
+/// is bounded by `opts.post_half_close_idle_timeout`: every successful read
+/// resets the deadline; if the deadline fires the forwarder returns
+/// `Err(TimedOut)`. `None` disables the post-half-close timeout entirely
+/// (matching legacy `copy_bidirectional` behavior). Each direction copies
+/// through its own `opts.buffer_size`-byte buffer.
+pub(crate) async fn forward_bidirectional<A, B>(a: A, b: B, opts: ForwardOpts) -> io::Result<()>
 where
     A: AsyncRead + AsyncWrite + Unpin,
     B: AsyncRead + AsyncWrite + Unpin,
 {
+    let idle = opts.post_half_close_idle_timeout;
     let (ar, aw) = io::split(a);
     let (br, bw) = io::split(b);
 
@@ -42,8 +60,8 @@ where
     let (atob_arm_tx, atob_arm_rx) = oneshot::channel::<Duration>();
     let (btoa_arm_tx, btoa_arm_rx) = oneshot::channel::<Duration>();
 
-    let atob = pump(ar, bw, atob_arm_rx, idle);
-    let btoa = pump(br, aw, btoa_arm_rx, idle);
+    let atob = pump(ar, bw, atob_arm_rx, idle, opts.buffer_size);
+    let btoa = pump(br, aw, btoa_arm_rx, idle, opts.buffer_size);
     tokio::pin!(atob);
     tokio::pin!(btoa);
 
@@ -103,18 +121,20 @@ pub(crate) fn is_post_half_close_idle_timeout(e: &io::Error) -> bool {
 /// sibling pump finishes; `configured_idle` is the immutable upper bound the
 /// EOF `shutdown()` is allowed to take (so a transport whose `poll_shutdown`
 /// flushes protocol bytes — e.g. WebSocket's Close frame — cannot stall the
-/// pump indefinitely on an unresponsive peer).
+/// pump indefinitely on an unresponsive peer). `buffer_size` is the chunk
+/// size of this direction's copy loop.
 async fn pump<R, W>(
     mut reader: R,
     mut writer: W,
     mut arm_idle: oneshot::Receiver<Duration>,
     configured_idle: Option<Duration>,
+    buffer_size: usize,
 ) -> io::Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; FORWARD_BUF_SIZE];
+    let mut buf = vec![0u8; buffer_size].into_boxed_slice();
     let mut idle: Option<Duration> = None;
 
     loop {
@@ -203,6 +223,55 @@ mod tests {
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, ReadBuf};
     use tokio::sync::Notify;
     use tokio::time::timeout;
+
+    fn with_idle(idle: Option<Duration>) -> ForwardOpts {
+        ForwardOpts {
+            post_half_close_idle_timeout: idle,
+            ..ForwardOpts::default()
+        }
+    }
+
+    /// The buffer size only affects chunking: a 1-byte buffer must still
+    /// forward a multi-KiB payload in both directions without loss.
+    #[tokio::test]
+    async fn tiny_buffer_forwards_complete_payload() {
+        let (a_outer, a_inner) = duplex(64);
+        let (b_outer, b_inner) = duplex(64);
+        let opts = ForwardOpts {
+            post_half_close_idle_timeout: Some(Duration::from_secs(5)),
+            buffer_size: 1,
+        };
+        let fwd = tokio::spawn(forward_bidirectional(a_inner, b_inner, opts));
+
+        let (mut a_r, mut a_w) = tokio::io::split(a_outer);
+        let (mut b_r, mut b_w) = tokio::io::split(b_outer);
+
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        let expected = payload.clone();
+        let writer = tokio::spawn(async move {
+            a_w.write_all(&payload).await.unwrap();
+            a_w.shutdown().await.unwrap();
+        });
+        let mut got = vec![0u8; expected.len()];
+        b_r.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, expected);
+        let n = b_r.read(&mut [0u8; 1]).await.unwrap();
+        assert_eq!(n, 0, "upstream must see FIN after the payload");
+        writer.await.unwrap();
+
+        // Reverse direction still works after the half-close.
+        b_w.write_all(b"ack").await.unwrap();
+        b_w.shutdown().await.unwrap();
+        let mut ack = [0u8; 3];
+        a_r.read_exact(&mut ack).await.unwrap();
+        assert_eq!(&ack, b"ack");
+
+        timeout(Duration::from_secs(5), fwd)
+            .await
+            .expect("forwarder hung")
+            .unwrap()
+            .unwrap();
+    }
 
     /// An `AsyncRead + AsyncWrite` wrapper that surfaces a `Notify` the moment
     /// `poll_write` returns `Pending` for the first time. Tests use it to
@@ -308,10 +377,10 @@ mod tests {
         let (a_outer, a_inner) = duplex(64);
         let (b_outer, b_inner) = duplex(64);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_inner,
             b_inner,
-            Some(Duration::from_secs(5)),
+            with_idle(Some(Duration::from_secs(5))),
         ));
 
         let (mut a_r, mut a_w) = tokio::io::split(a_outer);
@@ -354,10 +423,10 @@ mod tests {
         let (a_outer, a_inner) = duplex(8);
         let (b_outer, b_inner) = duplex(8);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_inner,
             b_inner,
-            Some(Duration::from_millis(200)),
+            with_idle(Some(Duration::from_millis(200))),
         ));
 
         let (_a_r, mut a_w) = tokio::io::split(a_outer);
@@ -398,10 +467,10 @@ mod tests {
         // hits backpressure on the A-write side.
         let (a_probe, write_pending) = WriteStallProbe::new(a_inner);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_probe,
             b_inner,
-            Some(Duration::from_millis(200)),
+            with_idle(Some(Duration::from_millis(200))),
         ));
 
         let (_a_r, mut a_w) = tokio::io::split(a_outer);
@@ -453,10 +522,10 @@ mod tests {
         // — that's the call that must time out.
         let b_inner = PendingShutdown::new(b_inner);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_inner,
             b_inner,
-            Some(Duration::from_millis(150)),
+            with_idle(Some(Duration::from_millis(150))),
         ));
 
         let (_a_r, mut a_w) = tokio::io::split(a_outer);
@@ -482,10 +551,10 @@ mod tests {
         let (a_outer, a_inner) = duplex(64);
         let (_b_outer, b_inner) = duplex(64);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_inner,
             b_inner,
-            Some(Duration::from_millis(150)),
+            with_idle(Some(Duration::from_millis(150))),
         ));
 
         let (_a_r, mut a_w) = tokio::io::split(a_outer);
@@ -508,9 +577,7 @@ mod tests {
         let (a_outer, a_inner) = duplex(64);
         let (_b_outer, b_inner) = duplex(64);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
-            a_inner, b_inner, None,
-        ));
+        let fwd = tokio::spawn(forward_bidirectional(a_inner, b_inner, with_idle(None)));
 
         let (_a_r, mut a_w) = tokio::io::split(a_outer);
         a_w.shutdown().await.unwrap();
@@ -530,10 +597,10 @@ mod tests {
         let (a_outer, a_inner) = duplex(64);
         let (b_outer, b_inner) = duplex(64);
 
-        let fwd = tokio::spawn(forward_bidirectional_with_idle_timeout(
+        let fwd = tokio::spawn(forward_bidirectional(
             a_inner,
             b_inner,
-            Some(Duration::from_millis(200)),
+            with_idle(Some(Duration::from_millis(200))),
         ));
 
         let (mut a_r, mut a_w) = tokio::io::split(a_outer);
