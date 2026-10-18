@@ -181,7 +181,15 @@ async fn forwarder_regression_across_transports() -> Result<()> {
         // On other OS accept run with either
         all(not(target_os = "macos"), any(feature = "native-tls", feature = "rustls")),
     ))]
-    run_for_transport_tls("tests/for_leak/tls_transport.toml", true).await?;
+    // SChannel (`native-tls` on Windows) tears down the whole TLS session on
+    // close_notify, so a half-close-then-respond exchange cannot be carried
+    // over it; that was equally true with `copy_bidirectional`. OpenSSL-based
+    // `native-tls` and `rustls` preserve it. Stuck-peer cleanup applies to all.
+    run_for_transport_tls(
+        "tests/for_leak/tls_transport.toml",
+        !cfg!(all(windows, feature = "native-tls")),
+    )
+    .await?;
 
     #[cfg(feature = "noise")]
     run_for_transport(PathBuf::from("tests/for_leak/noise_transport.toml"), true).await?;

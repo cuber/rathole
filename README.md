@@ -217,7 +217,7 @@ When a forwarded peer sends `FIN` (half-closes its write side) but never closes 
 - `0` is allowed and means "tear down immediately on half-close" — useful for protocols that never half-close legitimately.
 
 **Per-transport behavior.**
-- `tcp`, `tls`, `noise`: full half-close-then-respond preserved. The leak guard only arms the timeout after the surviving direction enters its post-EOF idle phase.
+- `tcp`, `tls`, `noise`: full half-close-then-respond preserved. The leak guard only arms the timeout after the surviving direction enters its post-EOF idle phase. One exception: with the `native-tls` backend on Windows (SChannel), close_notify closes the whole TLS session, so a peer cannot respond after the other side half-closes; `rustls` and OpenSSL-based `native-tls` do not have this limitation. This matches the previous `copy_bidirectional` behavior.
 - `socket_stream` (Unix domain sockets): same as TCP.
 - `websocket`, `websocket` (TLS): WebSocket cannot carry a half-close-then-respond pattern — RFC 6455 requires the receiver of a Close frame to reply with its own Close, which closes its sending side too. The timeout still bounds cleanup but cannot change the protocol's full-close semantics.
 
