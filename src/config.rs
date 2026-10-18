@@ -17,11 +17,6 @@ const DEFAULT_HEARTBEAT_TIMEOUT_SECS: u64 = 40;
 /// Client
 const DEFAULT_CLIENT_RETRY_INTERVAL_SECS: u64 = 1;
 
-/// How long the surviving direction may stay idle after the peer has
-/// half-closed before the forwarder tears the connection down. Only the
-/// surviving direction is bounded — full-duplex idle traffic is unaffected.
-const DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS: u64 = 120;
-
 /// String with Debug implementation that emits "MASKED"
 /// Used to mask sensitive strings when logging
 #[derive(Serialize, Deserialize, Default, PartialEq, Eq, Clone)]
@@ -243,24 +238,13 @@ fn default_client_retry_interval() -> u64 {
     DEFAULT_CLIENT_RETRY_INTERVAL_SECS
 }
 
-fn default_post_half_close_idle_timeout() -> PostHalfCloseIdleTimeout {
-    PostHalfCloseIdleTimeout(Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS))
-}
-
-/// Configurable post-half-close idle timeout. Accepts either a non-negative
-/// integer (seconds) or the string `"off"` (disables the timeout entirely,
-/// restoring legacy `copy_bidirectional` behavior).
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+/// Opt-in post-half-close idle timeout for the TCP / `socket_stream`
+/// forwarders. Accepts a non-negative integer (seconds) or the string
+/// `"off"`. Unset (the default) and `"off"` both leave the timeout disabled,
+/// which is the legacy `copy_bidirectional` behavior; `120` is a reasonable
+/// value when the leak guard is wanted.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Default)]
 pub struct PostHalfCloseIdleTimeout(pub Option<u64>);
-
-impl Default for PostHalfCloseIdleTimeout {
-    /// Match the serde missing-field default so a programmatic
-    /// `ClientConfig::default()` / `ServerConfig::default()` doesn't silently
-    /// disable the leak guard.
-    fn default() -> Self {
-        PostHalfCloseIdleTimeout(Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS))
-    }
-}
 
 impl PostHalfCloseIdleTimeout {
     pub fn as_duration(&self) -> Option<std::time::Duration> {
@@ -327,7 +311,7 @@ pub struct ClientConfig {
     pub heartbeat_timeout: u64,
     #[serde(default = "default_client_retry_interval")]
     pub retry_interval: u64,
-    #[serde(default = "default_post_half_close_idle_timeout")]
+    #[serde(default)]
     pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
 }
 
@@ -345,7 +329,7 @@ pub struct ServerConfig {
     pub transport: TransportConfig,
     #[serde(default = "default_heartbeat_interval")]
     pub heartbeat_interval: u64,
-    #[serde(default = "default_post_half_close_idle_timeout")]
+    #[serde(default)]
     pub post_half_close_idle_timeout: PostHalfCloseIdleTimeout,
 }
 
@@ -674,11 +658,9 @@ mod tests {
 
     #[test]
     fn post_half_close_idle_timeout_roundtrip() {
-        // Default: programmatic Default and serde missing-field must agree.
-        assert_eq!(
-            PostHalfCloseIdleTimeout::default().0,
-            Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS),
-        );
+        // Default: the leak guard is opt-in, so programmatic Default and the
+        // serde missing-field default must both be "off".
+        assert_eq!(PostHalfCloseIdleTimeout::default().0, None);
 
         let parsed: ClientConfig = toml::from_str(
             r#"
@@ -689,9 +671,8 @@ default_token = "t"
         )
         .unwrap();
         assert_eq!(
-            parsed.post_half_close_idle_timeout.0,
-            Some(DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS),
-            "missing field must default to {DEFAULT_POST_HALF_CLOSE_IDLE_TIMEOUT_SECS}s"
+            parsed.post_half_close_idle_timeout.0, None,
+            "missing field must leave the timeout off"
         );
 
         // Numeric value.
