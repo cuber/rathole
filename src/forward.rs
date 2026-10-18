@@ -12,7 +12,10 @@ use std::time::Duration;
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::oneshot;
 
-/// Buffer size per direction. Matches Tokio's internal `io::copy` chunk size.
+/// Buffer size per direction. Equal to tokio's `DEFAULT_BUF_SIZE` (8 KiB,
+/// `tokio/src/io/util/mod.rs`), which is what `io::copy` and
+/// `copy_bidirectional` allocate per direction, so the per-connection
+/// footprint is unchanged from the `copy_bidirectional` call this replaces.
 const FORWARD_BUF_SIZE: usize = 8 * 1024;
 
 /// Forward bytes in both directions between `a` and `b` until either side
@@ -231,9 +234,7 @@ mod tests {
         ) -> Poll<io::Result<usize>> {
             let me = self.get_mut();
             let r = Pin::new(&mut me.inner).poll_write(cx, buf);
-            if matches!(r, Poll::Pending)
-                && !me.first_pending.swap(true, Ordering::SeqCst)
-            {
+            if matches!(r, Poll::Pending) && !me.first_pending.swap(true, Ordering::SeqCst) {
                 me.notify.notify_waiters();
             }
             r
